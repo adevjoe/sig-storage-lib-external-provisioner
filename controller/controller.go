@@ -37,6 +37,7 @@ import (
 	storagebeta "k8s.io/api/storage/v1beta1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -1057,39 +1058,50 @@ func (ctrl *ProvisionController) syncClaim(ctx context.Context, obj interface{})
 	if err != nil {
 		ctrl.updateProvisionStats(claim, err, time.Time{})
 		return err
-	} else if should {
-		startTime := time.Now()
+	}
+	if !should {
+		return nil
+	}
+	klog.Info("Processing claim ", claim.Name)
+	startTime := time.Now()
 
-		status, err := ctrl.provisionClaimOperation(ctx, claim)
-		ctrl.updateProvisionStats(claim, err, startTime)
-		if err == nil || status == ProvisioningFinished {
-			// Provisioning is 100% finished / not in progress.
-			switch err {
-			case nil:
-				klog.V(5).Infof("Claim processing succeeded, removing PVC %s from claims in progress", claim.UID)
-			case errStopProvision:
-				klog.V(5).Infof("Stop provisioning, removing PVC %s from claims in progress", claim.UID)
-				// Our caller would requeue if we pass on this special error; return nil instead.
-				err = nil
-			default:
-				klog.V(2).Infof("Final error received, removing PVC %s from claims in progress", claim.UID)
-			}
-			ctrl.claimsInProgress.Delete(string(claim.UID))
-			return err
-		}
+	status, err := ctrl.provisionClaimOperation(ctx, claim)
+	ctrl.updateProvisionStats(claim, err, startTime)
+	if err != nil && err != errStopProvision {
 		if status == ProvisioningInBackground {
 			// Provisioning is in progress in background.
 			klog.V(2).Infof("Temporary error received, adding PVC %s to claims in progress", claim.UID)
 			ctrl.claimsInProgress.Store(string(claim.UID), claim)
-		} else {
-			// status == ProvisioningNoChange.
-			// Don't change claimsInProgress:
-			// - the claim is already there if previous status was ProvisioningInBackground.
-			// - the claim is not there if if previous status was ProvisioningFinished.
+			return err
 		}
+		klog.V(2).Infof("Final error received, removing PVC %s from claims in progress", claim.UID)
+		ctrl.claimsInProgress.Delete(string(claim.UID))
 		return err
 	}
-	return nil
+	switch status {
+	case ProvisioningFinished:
+		klog.V(5).Infof("Stop provisioning, removing PVC %s from claims in progress", claim.UID)
+		ctrl.claimsInProgress.Delete(string(claim.UID))
+		return nil
+	case ProvisioningNoChange:
+		ctrl.claimsInProgress.Delete(string(claim.UID))
+		return nil
+	case ProvisioningResize:
+		klog.V(5).Infof("Process resize pvc %s", claim.Name)
+		patchBytes := []byte(fmt.Sprintf(`[{"op": "replace", "path": "/spec/capacity/storage", "value": "%s"}]`,
+			claim.Spec.Resources.Requests.Storage()))
+		_, err := ctrl.client.CoreV1().PersistentVolumes().Patch(ctx, claim.Spec.VolumeName, types.JSONPatchType, patchBytes, metav1.PatchOptions{})
+		if err != nil {
+			klog.Errorf("Failed to resize volume %s: %v", claim.Spec.VolumeName, err)
+			return err
+		}
+		ctrl.claimsInProgress.Delete(string(claim.UID))
+		return err
+	default:
+		klog.V(5).Infof("Claim processing succeeded, removing PVC %s from claims in progress", claim.UID)
+		ctrl.claimsInProgress.Delete(string(claim.UID))
+		return nil
+	}
 }
 
 // syncVolume checks if the volume should be deleted and deletes if so
@@ -1193,9 +1205,9 @@ func (ctrl *ProvisionController) knownProvisioner(provisioner string) bool {
 // shouldProvision returns whether a claim should have a volume provisioned for
 // it, i.e. whether a Provision is "desired"
 func (ctrl *ProvisionController) shouldProvision(ctx context.Context, claim *v1.PersistentVolumeClaim) (bool, error) {
-	if claim.Spec.VolumeName != "" {
-		return false, nil
-	}
+	// if claim.Spec.VolumeName != "" {
+	// 	return false, nil
+	// }
 
 	if qualifier, ok := ctrl.provisioner.(Qualifier); ok {
 		if !qualifier.ShouldProvision(ctx, claim) {
@@ -1372,8 +1384,8 @@ func (ctrl *ProvisionController) provisionClaimOperation(ctx context.Context, cl
 	_, exists, err := ctrl.volumes.GetByKey(pvName)
 	if err == nil && exists {
 		// Volume has been already provisioned, nothing to do.
-		klog.Info(logOperation(operation, "persistentvolume %q already exists, skipping", pvName))
-		return ProvisioningFinished, errStopProvision
+		klog.Info(logOperation(operation, "persistentvolume %q update", pvName))
+		return ProvisioningResize, nil
 	}
 
 	// Prepare a claimRef to the claim early (to fail before a volume is

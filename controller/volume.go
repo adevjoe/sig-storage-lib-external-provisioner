@@ -20,7 +20,7 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	storageapis "k8s.io/api/storage/v1"
 )
 
@@ -97,6 +97,9 @@ const (
 	// that provisioning does not continue in the background. The error returned together
 	// with this state contains further information why rescheduling is needed.
 	ProvisioningReschedule ProvisioningState = "Reschedule"
+	// ProvisioningResize tells the controller that provisioning is in progress in the
+	// background after Provision call finished and the volume is being resized.
+	ProvisioningResize ProvisioningState = "Resize"
 )
 
 // IgnoredError is the value for Delete to return to indicate that the call has
